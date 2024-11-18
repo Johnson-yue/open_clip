@@ -15,10 +15,30 @@ import ftfy
 import numpy as np
 import regex as re
 import torch
+from types import SimpleNamespace
+import json
 
 # https://stackoverflow.com/q/62691279
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 _nltk_init = False
+
+# PartInfo
+pair_part ={
+    "!L":"!R",  "!R": "!L",
+    "$U":"$D", "$D":"$U" ,
+    "&LU":"&RD", "&RD":"&LU",
+    "&LD":"&RU", "&RU":"&LD",
+    "*":"*"
+}
+specifical_part = ["Ⅰ", "Ⅱ", "Ⅲ", "Ⅳ", "Ⅳ", "Ⅴ", "Ⅵ", 
+                   "Ⅶ", "Ⅷ", "Ⅸ", "Ⅹ", "Ⅺ", "Ⅻ",
+                   "ⅰ", "ⅱ", "ⅲ", "ⅳ", "ⅴ","ⅵ","ⅶ",
+                   "ⅷ","ⅸ", "ⅹ",
+                   "0","1","2","3","4","5","6","7","8","9", 
+                   ",", ".", "-", "_", ":", "‰",
+                   ] + [s for s in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"]
+
+
 
 DEFAULT_CONTEXT_LENGTH = 77  # default context length for OpenAI CLIP
 
@@ -519,3 +539,170 @@ class SigLipTokenizer:
             truncation=True,
         )
         return output.input_ids
+
+class FontTokenizer:
+    def __init__(self, token_dict:str, context_length):
+        
+        self.use_vocab = False
+        self.specifical_part = specifical_part
+
+        if token_dict.endswith("json") :
+            self.use_vocab = True
+            with open(token_dict, "r" , encoding="utf-8") as j:
+                json_data = json.load(j)
+            self.specifical_part = json_data["specifical_part"]
+
+            self.token_dict = json_data["token_dict"]
+            self.len = len(self.token_dict) // 2
+            
+        else:
+            
+            # load token dict
+            with open(token_dict, "r") as f:
+                token_dict = [line.strip("\n") for line in f.readlines()]
+            
+            
+            # Convert list-O(n) to dict-O(1)
+            self.token_dict = {ele:i for i , ele in enumerate(token_dict)}
+            self.len = len(self.token_dict)
+            # reverse k-v pair from ids to token_str
+            token_reverse = {str("%05d"%v):k for k,v in self.token_dict.items()}
+            self.token_dict.update(token_reverse)
+
+        print("=="*20)
+        print("token dict length:", self.len)
+        print("max annotation length:", context_length)
+        print("=="*20)
+
+    def save_pretrained(self, dest):
+        pass
+
+    def get_p1p2(self, ann_line):
+        """ from ann_line to part1+part2
+        Input:
+            丕<$U不(jsfk)$D一(j)>
+        Output:
+            丕/##$U/不/jsfk/##$D/一/j/
+        """
+        assert "<" in ann_line, "ann:[%s] error, have no '<'"%ann_line
+        
+        # get strokes (p1_strokes, p2_strokes)
+        strokes = re.finditer(r'[a-z]+', ann_line)
+
+        # get position encode (p1_pos, p2_pos)
+        matches = re.finditer(r"(!L|!R|\$U|\$D|&LU|&LD|&RU|&RD|\*)", ann_line)
+
+        c = ann_line[0]
+        out = (c,)  # add context to output
+        for match, stroke in zip(matches, strokes):
+            part_pos = match.group()
+            pos_end_idx = match.end()
+
+            part_c = ann_line[pos_end_idx]
+            if part_c in self.specifical_part:
+                part_c = "#"+part_c
+
+            part_stroke = stroke.group()
+            out += ("##"+part_pos, part_c, part_stroke)     # add "##" to part_pos
+        return out
+
+    def _encode(self, ann_line:str, max_length:int=77):
+        """
+        ann_line : 灾 
+                or 灾|<|##$U|宀|(|#k|#d|#e|)|##$D|火|(|#d|#s|#s|#l|)|> 
+                or 灾|<|##$U|宀|(|)|##$D|火|(|)|> 
+                or <|##$U|宀|(|)|##$D|火|(|)|>
+        """
+        if ann_line[0] == "|":
+            ann_line_new = ann_line[1:]
+            input_str = ["|"] + [s for s in ann_line_new.split("|") if s!=""]
+        else:
+            input_str = ann_line.split("|")
+        num_in = len(input_str)
+        assert num_in <= max_length, f"input_str:{num_in} > max_length:{max_length}"
+        mask = [True]*num_in
+
+        # Padded to max_length
+        input_ids = [self.token_dict[s] for s in input_str] + \
+                    [self.token_dict["pad"],]*(max_length - num_in)
+        mask_padded = mask + [False] * (max_length - num_in)
+        out = {'input_ids': input_ids, "mask":mask_padded, "length":num_in, "input_str":input_str}
+        out = SimpleNamespace(**out)
+        return out
+    
+    def encode(self, ann_line:str, output_type:int, max_length:int=77):
+        
+        if "<" not in ann_line or "<" == ann_line:
+            # get unsplitable content
+            
+            if output_type == 1:                 # single char : [亭]
+                input_str = [ann_line[0]]
+            elif output_type == 2:               # char and stroke : [亭 ( #k #j #f #c #j #d #e #j #g )] 
+                input_str = [ann_line[0], "(",] + ["#"+l for l in ann_line[2:-1]] +[")"] 
+            elif output_type == 3:
+                input_str = [ann_line[0], "(",")" ]
+            else:
+                input_str = [ann_line[0]]       # [亭()]
+        else:
+            # get splitable content
+            stroke_info = self.get_p1p2(ann_line)
+
+            if output_type == 1:                       # single char : [交]
+                input_str = [ann_line[0]]
+            elif output_type == 2:                     # char and stroke : [交 < ##$U 亠 ( #k #j ) ##$D 父 ( #s #k #s #l ) > ]
+                input_str = [stroke_info[0], "<", stroke_info[1], stroke_info[2], "("]
+                input_str += ["#"+s for s in stroke_info[3]] + [")"]  
+                input_str += [stroke_info[4], stroke_info[5]] + ["("] 
+                input_str += ["#"+s for s in stroke_info[6]] + [")", ">"] 
+            elif output_type == 3:                     # only part : [交 < ##$U 亠 ( ) ##$D 父 (  ) > ]
+                input_str = [stroke_info[0], "<",stroke_info[1], stroke_info[2], "(", ")", 
+                                stroke_info[4], stroke_info[5], "(", ")",  ">"]
+            elif output_type == 4:                     # only part : [< ##$U 亠 ( ) ##$D 父 (  ) > ]
+                input_str = ["<",stroke_info[1], stroke_info[2], "(", ")", 
+                                stroke_info[4], stroke_info[5], "(", ")",  ">"]
+            else:
+                input_str = input_str
+
+        num_in = len(input_str)
+        assert num_in <= max_length, f"input_str len:{num_in} > max_length:{self.max_length}"
+        mask = [True]*num_in
+
+        # pad to max_length with [pad] token
+        input_ids = [self.token_dict[s] for s in input_str] + \
+                    [self.token_dict["pad"], ]*(max_length - num_in)
+        mask_padded = mask + [False] *(max_length - num_in)
+
+        out = {"input_ids":input_ids, "mask":mask_padded, "length":num_in, 
+               "input_str":input_str}
+        return out   
+
+    def decode(self, tokens:Union[dict, torch.tensor], rm_pad=True):
+        # out = []
+        # if isinstance(tokens, dict):
+        #     tokens = tokens["input_ids"]
+        # for token in tokens:
+        #     if token == self.token_dict["pad"] and rm_pad:
+        #         break
+        #     out.append(self.token_dict[token])
+        # return "".join(out)
+        pass
+
+    def __call__(self, texts:Union[str, List[str]], context_lenght:Optional[int]=77) -> torch.Tensor:
+        if isinstance(texts, str):
+            texts = [texts]
+
+        assert context_lenght, "Please set a valid context length in class"
+
+        out = []
+        for text in texts:
+            token_out = self._encode(text, max_length=context_lenght)
+            input_ids = token_out.input_ids
+            
+            token = torch.LongTensor(input_ids)
+            out.append(token)
+
+        out = torch.cat(out, dim=0)
+        return out
+
+
+

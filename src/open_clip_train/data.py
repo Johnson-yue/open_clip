@@ -17,6 +17,11 @@ import webdataset as wds
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, IterableDataset, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import WeightedRandomSampler, Sampler
+from torch import Tensor
+from typing import Iterator, Optional, Sequence
+import torch.distributed as dist
+from tqdm import tqdm
 from webdataset.filters import _shuffle
 from webdataset.tariterators import base_plus_ext, url_opener, tar_file_expander, valid_sample
 
@@ -24,7 +29,8 @@ try:
     import horovod.torch as hvd
 except ImportError:
     hvd = None
-
+import torchvision.transforms as th_tfms
+from torchvision.transforms import InterpolationMode 
 
 class CsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
@@ -44,6 +50,87 @@ class CsvDataset(Dataset):
     def __getitem__(self, idx):
         images = self.transforms(Image.open(str(self.images[idx])))
         texts = self.tokenize([str(self.captions[idx])])[0]
+        return images, texts
+
+class FontCsvDataset(Dataset):
+    def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None,is_train=True):
+        logging.debug(f'Loading font csv data from {input_filename}.')
+        df = pd.read_csv(input_filename, sep=sep)
+
+        self.images = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
+        
+
+        data_aug =  {
+            # "rnd_rot":True,
+            # "rnd_crop":{"pad":15},
+            # "rnd_blur":{"k":0.5},
+        }
+
+        # self.transforms = transforms
+        size = 224
+        self.size = size
+        tfms = [th_tfms.Resize(size)] if "rnd_size" not in data_aug else [th_tfms.RandomResizedCrop(size)]
+        tfms += [] if "rnd_rot" not in data_aug else [th_tfms.RandomRotation(25, InterpolationMode.BILINEAR, fill=255, expand=True), th_tfms.Resize(size)]
+        tfms += [] if "rnd_hflip" not in data_aug else [th_tfms.RandomHorizontalFlip()]
+        tfms += [] if "rnd_vflip" not in data_aug else [th_tfms.RandomVerticalFlip()]
+        tfms += [] if "rnd_persp" not in data_aug else [th_tfms.RandomPerspective(distortion_scale=0.6, p=1.0, fill=255)]
+        tfms += [] if "rnd_crop"  not in data_aug else [th_tfms.RandomCrop(size, padding=data_aug["rnd_crop"]["pad"], fill=255)]
+        tfms += [th_tfms.ToTensor(), th_tfms.Normalize(mean=[0.5,]*3, std=[0.5,]*3)]
+        if "rnd_blur" in data_aug:
+            self.blur_k = data_aug["rnd_blur"]["k"]
+            self.use_blur =True
+        else:
+            self.use_blur = False
+        
+        self.train_tfms = th_tfms.Compose(tfms)
+        self.src_tfms = th_tfms.Compose([
+            th_tfms.Resize(size), th_tfms.ToTensor(), th_tfms.Normalize(mean=[0.5,]*3, std=[0.5,]*3)
+        ])
+
+        self.is_train = is_train
+
+        logging.debug('Done loading data.')
+
+        self.tokenize = tokenizer
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+
+        imgpath = str(self.images[idx])
+        path_infos = imgpath.split("/")
+        is_skeleton = "stroke" in path_infos[-3]
+
+        with Image.open(imgpath) as image:
+            image_np = np.asarray(image)
+            if image_np.ndim == 3:
+                image_np = image_np[:, :, 1]    # get render image data from green channel
+            
+            image_3c = np.expand_dims(image_np, axis=-1)
+            image_3c = np.repeat(image_3c, 3, axis=-1)
+
+            image = Image.fromarray(image_3c, mode="RGB") # convert np.ndarray to PIL.Image
+
+        images_aug = self.train_tfms(image)
+        if self.use_blur:
+            if random.random() < self.blur_k:
+                img_downsample = torch.nn.functional.interpolate(images_aug.unsqueeze(0), size=(self.size//3, self.size//3))
+                images_aug = torch.nn.functional.interpolate(img_downsample, size=(self.size, self.size), mode="bilinear")[0]
+        images_src = self.src_tfms(image)
+
+        images = images_aug if random.random() < 0.5 and self.is_train else images_src
+
+        captions = str(self.captions[idx]).split("\t")
+        if self.is_train:
+            caption = random.choice(captions)        
+            texts = self.tokenize([caption])
+        else:
+            texts = [self.tokenize([caption]).unsqueeze(0) for caption in captions]
+            if len(texts) <4:
+                texts += [texts[0]]
+            texts = torch.cat(texts, 0)
         return images, texts
 
 
@@ -473,6 +560,187 @@ def get_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
     return DataInfo(dataloader, sampler)
 
 
+
+#########################################################
+# Time : 2024-11-13
+# WeightedDistributedSampler
+# Func:  Step1 -WeightedSampler,  Step2 -DistributedSampler 
+#########################################################
+class WeightedDistributedSampler(Sampler[int]):
+
+    weights: Tensor
+    num_samples: int
+    replacement: bool
+
+    def __init__(self, dataset: Dataset, weights: Sequence[float], num_replicas: Optional[int] = None,
+                 rank: Optional[int] = None, shuffle: bool = True,
+                 seed: int = 0, drop_last: bool = False,
+                 replacement: bool = True, generator=None   # Weight Sampler Param
+                 ) -> None:
+        
+        # -----------------DistributedSampler Init ---------------------
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.drop_last = drop_last
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and len(self.dataset) % self.num_replicas != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (len(self.dataset) - self.num_replicas) / self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(len(self.dataset) / self.num_replicas)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.num_replicas
+        self.shuffle = shuffle
+        self.seed = seed
+
+        # ------------------WeightedSampler Init ------------------------
+        num_samples = len(self.dataset)
+        weights_tensor = torch.as_tensor(weights, dtype=torch.double)
+        if len(weights_tensor.shape) != 1:
+            raise ValueError("weights should be a 1d sequence but given "
+                             f"weights have shape {tuple(weights_tensor.shape)}")
+        
+        self.weights = weights_tensor
+        self.weights_num_samples = num_samples
+        self.replacement = replacement
+        self.generator = generator
+
+    def __iter__(self) -> Iterator[int]:
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()  # type: ignore[arg-type]
+        else:
+            # indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+            if self.generator:
+                g = torch.Generator()
+                g.manual_seed(self.seed + self.epoch)
+            else:
+                g = self.generator
+            indices = torch.multinomial(self.weights, self.weights_num_samples, self.replacement, generator=g).tolist()
+
+
+        if not self.drop_last:
+            # add extra samples to make it evenly divisible
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            # remove tail of data to make it evenly divisible.
+            indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+
+        # subsample
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Set the epoch for this sampler.
+
+        When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+
+def get_sample_weight(dataset:Dataset, statis_json:str):
+
+    weights = []
+    assert os.path.isfile(statis_json)
+    with open(statis_json, "r" , encoding="utf-8") as j:
+        statis = json.load(j)
+    
+    content_stat = statis["content_stat"]
+    style_stat = statis["style_stat"]   # not use
+    stroke_stat = statis["stroke_stat"] # not use
+
+    images = dataset.images
+
+    for image in tqdm(images, total=len(images), desc="compute weights for every sample"):
+        human_label = image.split("/")[-1].split("_")[1]
+
+        weight = 1 / (content_stat[human_label])
+        weights.append(weight)
+
+    return weights
+
+
+def get_font_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None, weighted_sampler=True):
+    input_filename = args.train_data if is_train else args.val_data
+    assert input_filename
+    dataset = FontCsvDataset(
+        input_filename,
+        preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,
+        sep=args.csv_separator,
+        tokenizer=tokenizer,
+        is_train=is_train
+    )
+    num_samples = len(dataset)
+    shuffle=False
+
+    if weighted_sampler:
+        weights  = get_sample_weight(dataset, statis_json="data/font_statis_1712.json")
+        
+        if args.distributed and is_train:
+            sampler = WeightedDistributedSampler(
+                dataset, weights, shuffle=False
+            )
+        elif is_train:
+            sampler = WeightedRandomSampler(weights, len(weights))
+        else:
+            sampler = None
+            shuffle = True
+
+    else:
+        sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+        shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
+
 class SyntheticDataset(Dataset):
 
     def __init__(
@@ -528,6 +796,8 @@ def get_dataset_fn(data_path, dataset_type):
         return get_wds_dataset
     elif dataset_type == "csv":
         return get_csv_dataset
+    elif dataset_type == "font_csv":
+        return get_font_csv_dataset
     elif dataset_type == "synthetic":
         return get_synthetic_dataset
     elif dataset_type == "auto":

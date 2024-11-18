@@ -33,7 +33,7 @@ from open_clip_train.distributed import is_master, init_distributed_device, broa
 from open_clip_train.logger import setup_logging
 from open_clip_train.params import parse_args
 from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from open_clip_train.train import train_one_epoch, evaluate
+from open_clip_train.train import train_one_epoch, evaluate, evaluate_fontcsv
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
 
@@ -359,7 +359,7 @@ def main(args):
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
     # initialize datasets
-    tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir)
+    tokenizer = get_tokenizer(args.model, context_length=77, token_dict="data/font_vocab_1712.json")  # token_dict="data/stroke_token_dict.txt"
     data = get_data(
         args,
         (preprocess_train, preprocess_val),
@@ -436,7 +436,8 @@ def main(args):
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
         # Evaluate.
-        evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        # evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer) # original
+        evaluate_fontcsv(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer) # font-csv
         return
 
     loss = create_loss(args)
