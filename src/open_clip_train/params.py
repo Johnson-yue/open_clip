@@ -126,7 +126,7 @@ def parse_args(args):
         help="Optional identifier for the experiment when storing logs. Otherwise use current time.",
     )
     parser.add_argument(
-        "--workers", type=int, default=4, help="Number of dataloader workers per GPU."
+        "--workers", type=int, default=20, help="Number of dataloader workers per GPU."
     )
     parser.add_argument(
         "--batch-size", type=int, default=64, help="Batch size per GPU."
@@ -463,6 +463,13 @@ def parse_args(args):
         default=False,
         action="store_true",
         help='Use SigLip (sigmoid) loss.'
+    )
+
+    parser.add_argument(
+        "--use_rope",
+        default=False,
+        action="store_true",
+        help='Use Dynamtic loading Rope in Model Replace absolut Position Embedding'
     )
 
     args = parser.parse_args(args)

@@ -9,8 +9,11 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple
-from .pos_embed import get_2d_sincos_pos_embed
-
+from .pos_embed import (get_2d_sincos_pos_embed,
+                        get_1d_rotary_pos_embed,
+                        get_2d_rotary_pos_embed,
+                        apply_rotary_emb)
+import numpy as np
 
 class LayerNormFp32(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
@@ -218,8 +221,11 @@ class ResidualAttentionBlock(nn.Module):
             norm_layer: Callable = LayerNorm,
             is_cross_attention: bool = False,
             batch_first: bool = True,
+            rope_type:str = "none"  # ["none", "1d", "2d"]
     ):
         super().__init__()
+
+        self.rope_type = rope_type
 
         self.ln_1 = norm_layer(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=batch_first)
@@ -258,10 +264,72 @@ class ResidualAttentionBlock(nn.Module):
             v_x: Optional[torch.Tensor] = None,
             attn_mask: Optional[torch.Tensor] = None,
     ):
-        k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
+        if self.rope_type == "1d":
+
+            # q : Norm -> Rope-1d
+            q_x_rope_embed = get_1d_rotary_pos_embed(
+                dim=q_x.size(-1), 
+                pos=q_x.size(-2),     # or [np.array([0,1, 2, 3, 4])]
+                repeat_interleave_real=True, use_real=True, freqs_dtype=torch.float64
+            ) # cos, sin
+            q_x_pe = apply_rotary_emb(self.ln_1(q_x), q_x_rope_embed)
+
+            # k : Norm -> Rope-1d
+            if hasattr(self, "ln_1_kv") and k_x is not None:
+                k_x_norm = self.ln_1_kv(k_x)
+                k_x_rope_embed =  get_1d_rotary_pos_embed(
+                    dim=k_x.size(-1), 
+                    pos=k_x.size(-2),     # or [np.array([0,1, 2, 3, 4])]
+                    repeat_interleave_real=True, use_real=True, freqs_dtype=torch.float64
+                ) # cos, sin
+                k_x_pe = apply_rotary_emb(k_x_norm, k_x_rope_embed)
+            else:
+                k_x_pe = k_x
+
+        elif self.rope_type =="2d":
+            
+            # q : Norm -> Rope-2d
+            # In Vision Attention Block, it received  feature from image 
+            # shape is (bs, 1+grid_size**2, seq_dim)
+            # Norm and Rope
+            grid_size = int(np.sqrt(q_x.size(1)- 1))
+            seq_dim = q_x.size(-1)
+
+            cls_rotary2d_emb = get_2d_rotary_pos_embed(
+                seq_dim,((0,0), (1,1)),
+                grid_size=(1,1), use_real=True
+            )
+            image_rotary2d_emb = get_2d_rotary_pos_embed(
+                seq_dim, ((1,1), (1+grid_size, 1+grid_size)),
+                grid_size=(grid_size, grid_size), use_real=True
+            )
+            rotary2d_emb = (
+                torch.cat([cls_rotary2d_emb[0], image_rotary2d_emb[0]], dim=0),
+                torch.cat([cls_rotary2d_emb[1], image_rotary2d_emb[1]], dim=0)
+            )
+
+            q_x_pe = apply_rotary_emb(self.ln_1(q_x), rotary2d_emb)
+
+            # k : Norm -> Rope-2d
+            if hasattr(self, "ln_1_kv") and k_x is not None:
+                k_x_norm = self.ln_1_kv(k_x)
+                k_x_pe = apply_rotary_emb(k_x_norm, rotary2d_emb)
+            else:
+                k_x_pe = k_x
+        else:
+            # when rope_type == "none"
+            q_x_pe=self.ln_1(q_x)
+            k_x_pe = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
+
+
         v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
-        x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
+        x = q_x + self.ls_1(self.attention(q_x=q_x_pe, k_x=k_x_pe, v_x=v_x, attn_mask=attn_mask))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
+
+        if self.rope_type == "1d":
+            del q_x_rope_embed
+        elif self.rope_type == "2d":
+            del cls_rotary2d_emb, image_rotary2d_emb, rotary2d_emb
         return x
 
 
@@ -327,6 +395,7 @@ class Transformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             batch_first: bool = True,
+            rope_type:str = "none", # [none , 1d, 2d]
     ):
         super().__init__()
         self.width = width
@@ -343,6 +412,7 @@ class Transformer(nn.Module):
                 act_layer=act_layer,
                 norm_layer=norm_layer,
                 batch_first=batch_first,
+                rope_type=rope_type,
             )
             for _ in range(layers)
         ])
@@ -455,6 +525,7 @@ class VisionTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
+            use_rope:bool = False,
     ):
         super().__init__()
         assert pool_type in ('tok', 'avg', 'none')
@@ -464,25 +535,29 @@ class VisionTransformer(nn.Module):
         self.grid_size = (image_height // patch_height, image_width // patch_width)
         self.final_ln_after_pool = final_ln_after_pool  # currently ignored w/ attn pool enabled
         self.output_dim = output_dim
+        self.use_rope = use_rope
 
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         # class embeddings and positional embeddings
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        if pos_embed_type == 'learnable':
-            self.positional_embedding = nn.Parameter(
-                scale * torch.randn(self.grid_size[0] * self.grid_size[1] + 1, width))
-        elif pos_embed_type == 'sin_cos_2d':
-            # fixed sin-cos embedding
-            assert self.grid_size[0] == self.grid_size[1],\
-                'currently sin cos 2d pos embedding only supports square input'
-            self.positional_embedding = nn.Parameter(
-                torch.zeros(self.grid_size[0] * self.grid_size[1] + 1, width), requires_grad=False)
-            pos_embed_type = get_2d_sincos_pos_embed(width, self.grid_size[0], cls_token=True)
-            self.positional_embedding.data.copy_(torch.from_numpy(pos_embed_type).float())
-        else:
-            raise ValueError
+
+        if not use_rope :
+            
+            if pos_embed_type == 'learnable':
+                self.positional_embedding = nn.Parameter(
+                    scale * torch.randn(self.grid_size[0] * self.grid_size[1] + 1, width))
+            elif pos_embed_type == 'sin_cos_2d':
+                # fixed sin-cos embedding
+                assert self.grid_size[0] == self.grid_size[1],\
+                    'currently sin cos 2d pos embedding only supports square input'
+                self.positional_embedding = nn.Parameter(
+                    torch.zeros(self.grid_size[0] * self.grid_size[1] + 1, width), requires_grad=False)
+                pos_embed_type = get_2d_sincos_pos_embed(width, self.grid_size[0], cls_token=True)
+                self.positional_embedding.data.copy_(torch.from_numpy(pos_embed_type).float())
+            else:
+                raise ValueError
 
         # setting a patch_dropout of 0. would mean it is disabled and this function would be the identity fn
         self.patch_dropout = PatchDropout(patch_dropout) if patch_dropout > 0. else nn.Identity()
@@ -496,6 +571,7 @@ class VisionTransformer(nn.Module):
             ls_init_value=ls_init_value,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            rope_type="2d" if use_rope else "none",
         )
 
         if attentional_pool:
@@ -547,9 +623,9 @@ class VisionTransformer(nn.Module):
                 [
                     self.conv1,
                     self.class_embedding,
-                    self.positional_embedding,
+                    # self.positional_embedding,
                     self.ln_pre,
-                ],
+                ] + [self.positional_embedding] if not self.use_rope else [],
                 *self.transformer.resblocks[:-1],
                 [
                     self.transformer.resblocks[-1],
@@ -611,9 +687,25 @@ class VisionTransformer(nn.Module):
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
 
         # class embeddings and positional embeddings
-        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        class_embedding = _expand_token(self.class_embedding, x.shape[0]).to(x.dtype)
+        
+        if self.use_rope:
+            # Add Rope to embedding
+            cls_rotary2d_emb = get_2d_rotary_pos_embed(class_embedding.size(-1), ((0,0),(0,0)), 
+                                                    grid_size=(1, 1), use_real=True )
+            x_rotary2d_emb = get_2d_rotary_pos_embed(x.size(-1), ((1,1), (1+self.grid_size[0],1+self.grid_size[1])),
+                                                    grid_size=self.grid_size, use_real=True)
+            rotary2d_emb = (
+                torch.cat([cls_rotary2d_emb[0], x_rotary2d_emb[0]], dim=0).to(x.dtype),
+                torch.cat([cls_rotary2d_emb[1], x_rotary2d_emb[1]], dim=0).to(x.dtype)
+            )
+        
+        x = torch.cat([class_embedding, x], dim=1)
         # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        if self.use_rope:
+            x = apply_rotary_emb(x, rotary2d_emb)
+        else:
+            x = x + self.positional_embedding.to(x.dtype)
 
         x = self.patch_dropout(x)
         x = self.ln_pre(x)
@@ -643,6 +735,9 @@ class VisionTransformer(nn.Module):
 
         if self.proj is not None:
             pooled = pooled @ self.proj
+
+        if self.use_rope:
+            del cls_rotary2d_emb, x_rotary2d_emb, rotary2d_emb # remove for save CPU memory
 
         if self.output_tokens:
             return pooled, tokens
@@ -687,6 +782,7 @@ class TextTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
+            use_rope:bool = False
     ):
         super().__init__()
         assert pool_type in ('first', 'last', 'argmax', 'none')
@@ -698,6 +794,7 @@ class TextTransformer(nn.Module):
         self.heads = heads
         self.pad_id = pad_id
         self.pool_type = pool_type
+        self.use_rope = use_rope
 
         self.token_embedding = nn.Embedding(vocab_size, width)
         if embed_cls:
@@ -705,7 +802,9 @@ class TextTransformer(nn.Module):
             self.num_pos += 1
         else:
             self.cls_emb = None
-        self.positional_embedding = nn.Parameter(torch.empty(self.num_pos, width))
+        
+        if not use_rope:
+            self.positional_embedding = nn.Parameter(torch.empty(self.num_pos, width))
         self.transformer = Transformer(
             width=width,
             layers=layers,
@@ -714,6 +813,7 @@ class TextTransformer(nn.Module):
             ls_init_value=ls_init_value,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            rope_type="1d" if use_rope else "none",  # if use_rope is True, rope_type ="1d", else "none"
         )
         self.ln_final = norm_layer(width)
 
@@ -734,7 +834,8 @@ class TextTransformer(nn.Module):
 
     def init_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
-        nn.init.normal_(self.positional_embedding, std=0.01)
+        if not self.use_rope:
+            nn.init.normal_(self.positional_embedding, std=0.01)
         if self.cls_emb is not None:
             nn.init.normal_(self.cls_emb, std=0.01)
 
@@ -789,7 +890,16 @@ class TextTransformer(nn.Module):
             if attn_mask is not None:
                 attn_mask = attn_mask[None, :seq_len, :seq_len] + cls_mask[:, :seq_len, :seq_len]
 
-        x = x + self.positional_embedding[:seq_len].to(cast_dtype)
+        if self.use_rope:
+            x_rope_emb = get_1d_rotary_pos_embed(
+                dim=x.size(-1),     #  d_model
+                pos=x.size(-2),     #  seq_len == n_ctx 
+                repeat_interleave_real=True, use_real=True, freqs_dtype=torch.float64
+            ) # cos, sin
+            k_x_rope = apply_rotary_emb(x, x_rope_emb)
+            x = k_x_rope.to(cast_dtype)
+        else:
+            x = x + self.positional_embedding[:seq_len].to(cast_dtype)
         x = self.transformer(x, attn_mask=attn_mask)
 
         # x.shape = [batch_size, n_ctx, transformer.width]

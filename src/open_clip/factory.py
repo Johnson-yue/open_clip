@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 
 from .convert import convert_state_dict
-from .model import CLIP, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
+from .model import CLIP,CLIP_Rope, CustomTextCLIP, convert_weights_to_lp, convert_to_custom_text_state_dict,\
     resize_pos_embed, get_cast_dtype, resize_text_pos_embed, set_model_preprocess_cfg
 from .coca_model import CoCa
 from .loss import ClipLoss, DistillClipLoss, CoCaLoss, SigLipLoss
@@ -129,6 +129,8 @@ def get_tokenizer(
             cache_dir=cache_dir,
             **tokenizer_kwargs,
         )
+    elif "token_dict" in kwargs:
+        tokenizer = FontTokenizer(token_dict=kwargs["token_dict"], context_length=context_length)
     else:
         tokenizer = SimpleTokenizer(
             context_length=context_length,
@@ -136,14 +138,6 @@ def get_tokenizer(
         )
 
     return tokenizer
-
-def get_tokenizer(model_name:str="",
-                  context_length:Optional[int]=None,
-                  token_dict:str=""):
-
-    tokenizer = FontTokenizer(token_dict, context_length)    
-    return tokenizer
-
 
 def load_state_dict(
         checkpoint_path: str,
@@ -174,7 +168,7 @@ def load_state_dict(
 
 
 def load_checkpoint(
-        model: Union[CLIP, CustomTextCLIP],
+        model: Union[CLIP, CustomTextCLIP, CLIP_Rope],
         checkpoint_path: str,
         strict: bool = True,
         weights_only: bool = True,
@@ -192,7 +186,7 @@ def load_checkpoint(
     state_dict = convert_state_dict(model, state_dict)
 
     # Detect old format and make compatible with new format
-    if 'positional_embedding' in state_dict and not hasattr(model, 'positional_embedding'):
+    if 'positional_embedding' in state_dict and not hasattr(model, 'positional_embedding') and not isinstance(model, CLIP_Rope):
         state_dict = convert_to_custom_text_state_dict(state_dict)
 
     # If loading a non-SigLIP model for SigLIP training. See https://github.com/mlfoundations/open_clip/issues/712
@@ -204,8 +198,9 @@ def load_checkpoint(
     if position_id_key in state_dict and not hasattr(model, position_id_key):
         del state_dict[position_id_key]
 
-    resize_pos_embed(state_dict, model)
-    resize_text_pos_embed(state_dict, model)
+    if not isinstance(model, CLIP_Rope):
+        resize_pos_embed(state_dict, model)
+        resize_text_pos_embed(state_dict, model)
 
     # Finally, load the massaged state_dict into model
     incompatible_keys = model.load_state_dict(state_dict, strict=strict)
@@ -339,6 +334,9 @@ def create_model(
             model = CoCa(**model_cfg, cast_dtype=cast_dtype)
         else:
             model = CustomTextCLIP(**model_cfg, cast_dtype=cast_dtype)
+    elif "use_rope" in model_kwargs:
+        model = CLIP_Rope(**model_cfg, cast_dtype=cast_dtype)
+    
     else:
         model = CLIP(**model_cfg, cast_dtype=cast_dtype)
 
@@ -388,7 +386,7 @@ def create_model(
 
         if checkpoint_path:
             logging.info(f'Loading pretrained {model_name} weights ({pretrained}).')
-            load_checkpoint(model, checkpoint_path, weights_only=load_weights_only)
+            load_checkpoint(model, checkpoint_path, weights_only=load_weights_only, strict=False if isinstance(model, CLIP_Rope) else True )
         else:
             error_str = (
                 f'Pretrained weights ({pretrained}) not found for model {model_name}.'
@@ -477,7 +475,7 @@ def create_model_and_transforms(
         pretrained_hf: bool = True,
         cache_dir: Optional[str] = None,
         output_dict: Optional[bool] = None,
-        load_weights_only: bool = True,
+        load_weights_only: bool = False,
         **model_kwargs,
 ):
     force_preprocess_cfg = merge_preprocess_kwargs(

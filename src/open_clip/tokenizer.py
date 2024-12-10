@@ -554,6 +554,7 @@ class FontTokenizer:
 
             self.token_dict = json_data["token_dict"]
             self.len = len(self.token_dict) // 2
+            self.json_data = json_data
             
         else:
             
@@ -617,7 +618,7 @@ class FontTokenizer:
             ann_line_new = ann_line[1:]
             input_str = ["|"] + [s for s in ann_line_new.split("|") if s!=""]
         else:
-            input_str = ann_line.split("|")
+            input_str = ann_line.split("|") if "|" in ann_line else ann_line
         num_in = len(input_str)
         assert num_in <= max_length, f"input_str:{num_in} > max_length:{max_length}"
         mask = [True]*num_in
@@ -698,7 +699,7 @@ class FontTokenizer:
             token_out = self._encode(text, max_length=context_lenght)
             input_ids = token_out.input_ids
             
-            token = torch.LongTensor(input_ids)
+            token = torch.LongTensor(input_ids).unsqueeze(0)
             out.append(token)
 
         out = torch.cat(out, dim=0)

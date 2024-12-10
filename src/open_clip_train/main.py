@@ -36,6 +36,7 @@ from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from open_clip_train.train import train_one_epoch, evaluate, evaluate_fontcsv
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 
+# from font_tools.yq_rope import add_rope_to_model      # This is for Dynamic
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
@@ -219,6 +220,10 @@ def main(args):
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
+
+    if args.use_rope:
+        model_kwargs["use_rope"] = True
+
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,
@@ -239,6 +244,11 @@ def main(args):
         cache_dir=args.cache_dir,
         **model_kwargs,
     )
+
+    # Dynamtic forward for single-GPU training not use DDP mode
+    # if args.use_rope:
+    #     model = add_rope_to_model(model)
+
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
         dist_model, _, _ = create_model_and_transforms(

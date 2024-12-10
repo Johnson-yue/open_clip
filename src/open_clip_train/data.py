@@ -99,39 +99,46 @@ class FontCsvDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        imgpath = str(self.images[idx])
-        path_infos = imgpath.split("/")
-        is_skeleton = "stroke" in path_infos[-3]
+        try:
+            imgpath = str(self.images[idx])
+            path_infos = imgpath.split("/")
+            is_skeleton = "stroke" in path_infos[-3]
 
-        with Image.open(imgpath) as image:
-            image_np = np.asarray(image)
-            if image_np.ndim == 3:
-                image_np = image_np[:, :, 1]    # get render image data from green channel
-            
-            image_3c = np.expand_dims(image_np, axis=-1)
-            image_3c = np.repeat(image_3c, 3, axis=-1)
+            with Image.open(imgpath) as image:
+                image_np = np.asarray(image)
+                if image_np.ndim == 3:
+                    image_np = image_np[:, :, 1]    # get render image data from green channel
+                
+                image_3c = np.expand_dims(image_np, axis=-1)
+                image_3c = np.repeat(image_3c, 3, axis=-1)
 
-            image = Image.fromarray(image_3c, mode="RGB") # convert np.ndarray to PIL.Image
+                image = Image.fromarray(image_3c, mode="RGB") # convert np.ndarray to PIL.Image
 
-        images_aug = self.train_tfms(image)
-        if self.use_blur:
-            if random.random() < self.blur_k:
-                img_downsample = torch.nn.functional.interpolate(images_aug.unsqueeze(0), size=(self.size//3, self.size//3))
-                images_aug = torch.nn.functional.interpolate(img_downsample, size=(self.size, self.size), mode="bilinear")[0]
-        images_src = self.src_tfms(image)
+            images_aug = self.train_tfms(image)
+            if self.use_blur:
+                if random.random() < self.blur_k:
+                    img_downsample = torch.nn.functional.interpolate(images_aug.unsqueeze(0), size=(self.size//3, self.size//3))
+                    images_aug = torch.nn.functional.interpolate(img_downsample, size=(self.size, self.size), mode="bilinear")[0]
+            images_src = self.src_tfms(image)
 
-        images = images_aug if random.random() < 0.5 and self.is_train else images_src
+            images = images_aug if random.random() < 0.5 and self.is_train else images_src
 
-        captions = str(self.captions[idx]).split("\t")
-        if self.is_train:
-            caption = random.choice(captions)        
-            texts = self.tokenize([caption])
-        else:
-            texts = [self.tokenize([caption]).unsqueeze(0) for caption in captions]
-            if len(texts) <4:
-                texts += [texts[0]]
-            texts = torch.cat(texts, 0)
-        return images, texts
+            captions = str(self.captions[idx]).split("\t")
+            if self.is_train:
+                caption = random.choice(captions)        
+                texts = self.tokenize([caption]).squeeze()  # text shape is [77]
+            else:
+                texts = [self.tokenize([caption]) for caption in captions]
+                if len(texts) <4:
+                    texts += [texts[0]]
+                texts = torch.cat(texts, 0)         #  val text shape is [4, 77]
+            return images, texts
+        except Exception as e:
+            print("DataLoader Err:", e)
+            print("total size :", len(self.images))
+            print("Current idx: ", idx)
+            print(f"img: {self.images[idx]} - cap: {self.captions[idx]}")
+
 
 
 class SharedEpoch:
@@ -573,7 +580,7 @@ class WeightedDistributedSampler(Sampler[int]):
     replacement: bool
 
     def __init__(self, dataset: Dataset, weights: Sequence[float], num_replicas: Optional[int] = None,
-                 rank: Optional[int] = None, shuffle: bool = True,
+                 rank: Optional[int] = None, shuffle: bool = False,
                  seed: int = 0, drop_last: bool = False,
                  replacement: bool = True, generator=None   # Weight Sampler Param
                  ) -> None:
@@ -591,7 +598,7 @@ class WeightedDistributedSampler(Sampler[int]):
             raise ValueError(
                 f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]")
         self.dataset = dataset
-        self.num_replicas = num_replicas
+        self.num_replicas = num_replicas        # This is number of GPUs, like 4
         self.rank = rank
         self.epoch = 0
         self.drop_last = drop_last
@@ -611,14 +618,12 @@ class WeightedDistributedSampler(Sampler[int]):
         self.seed = seed
 
         # ------------------WeightedSampler Init ------------------------
-        num_samples = len(self.dataset)
         weights_tensor = torch.as_tensor(weights, dtype=torch.double)
         if len(weights_tensor.shape) != 1:
             raise ValueError("weights should be a 1d sequence but given "
                              f"weights have shape {tuple(weights_tensor.shape)}")
         
         self.weights = weights_tensor
-        self.weights_num_samples = num_samples
         self.replacement = replacement
         self.generator = generator
 
@@ -631,11 +636,11 @@ class WeightedDistributedSampler(Sampler[int]):
         else:
             # indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
             if self.generator:
+                g = self.generator
+            else:
                 g = torch.Generator()
                 g.manual_seed(self.seed + self.epoch)
-            else:
-                g = self.generator
-            indices = torch.multinomial(self.weights, self.weights_num_samples, self.replacement, generator=g).tolist()
+            indices = torch.multinomial(self.weights, len(self.dataset), self.replacement, generator=g).tolist()
 
 
         if not self.drop_last:
@@ -688,6 +693,7 @@ def get_sample_weight(dataset:Dataset, statis_json:str):
     for image in tqdm(images, total=len(images), desc="compute weights for every sample"):
         human_label = image.split("/")[-1].split("_")[1]
 
+        assert content_stat[human_label] != 0, f"human_label={human_label} is 0"
         weight = 1 / (content_stat[human_label])
         weights.append(weight)
 
@@ -832,3 +838,47 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
         data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")
 
     return data
+
+
+if __name__ == "__main__":
+    from open_clip.tokenizer import FontTokenizer
+    from tqdm import tqdm
+    tokenizer =  FontTokenizer(token_dict="data/font_vocab_1712.json", 
+                               context_length=77)
+
+    train_ds = FontCsvDataset(
+        "data/csv/train_fontV4_s1712.csv",
+        None,
+        img_key="filepath",
+        caption_key="title",
+        sep=",",
+        tokenizer=tokenizer,
+        is_train=True
+    )
+
+    val_ds = FontCsvDataset(
+        "data/csv/val_fontV4_s1712.csv",
+        None,
+        img_key="filepath",
+        caption_key="title",
+        sep=",",
+        tokenizer=tokenizer,
+        is_train=True
+    )
+
+
+    dl = DataLoader(
+        train_ds,
+        batch_size=256,
+        shuffle=True,
+        num_workers=40,
+        pin_memory=True,
+        drop_last=False,
+    )
+    # for d_info in tqdm(val_ds, total=len(val_ds), desc="val_ds"):
+    #     pass
+
+    for d_info in tqdm(dl, total=len(dl), desc="train_ds"):
+        pass
+
+    
