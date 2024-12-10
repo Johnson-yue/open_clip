@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import time
+import psutil
 
 import numpy as np
 import torch
@@ -217,6 +218,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
                 f"LR: {optimizer.param_groups[0]['lr']:5f} "
+                f"Mem: {psutil.virtual_memory().percent:.2f} % "
                 f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
             )
 
@@ -385,7 +387,7 @@ def evaluate_fontcsv(model, data, epoch, args, tb_writer=None, tokenizer=None):
         all_image_features, all_text_features = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
-                images, texts = batch
+                images, texts = batch       # images shape (bs , 3, h, w), texts shape (bs, 4, 77)
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
 
@@ -404,7 +406,7 @@ def evaluate_fontcsv(model, data, epoch, args, tb_writer=None, tokenizer=None):
                     # choice only one text_features from four text_features, which argmax inner_product(image_feat, text_feature)
                     # Althought max inner_product for choice which text_feature will be used
                     logits_per_image_pre = [logit_scale * image_features @ text_features.t() for text_features in texts_features]
-                    logits_per_image_pre_cat = torch.stack(logits_per_image_pre, dim=2) # (bs, 4)
+                    logits_per_image_pre_cat = torch.stack(logits_per_image_pre, dim=2) # (bs, bs, 4)
                     max_indics = torch.argmax(logits_per_image_pre_cat, dim=2).diagonal()  # (bs,)
                     
                     text_features_reshape = torch.stack(texts_features, dim=1) #(bs, 4, 768)
