@@ -12,9 +12,9 @@ from src.open_clip.tokenizer import FontTokenizer
 
 class FontClip_Inference():
 
-    def __init__(self, device=None, size=224):
+    def __init__(self, device=None, size=224, model_path=None, **model_opt):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_path = "logs/CLIP_font_ViT_L14_s1712_aug/checkpoints/epoch_8.pt"
+        model_path = "logs/ViT_L14_s1712_aug/checkpoints/epoch_8.pt" if model_path is None else model_path
         model_name = "ViT-L-14"
         ann_file = "data/font_strokes_v2_lv1_release.txt"
         token_dict="data/stroke_token_dict.txt"
@@ -26,6 +26,7 @@ class FontClip_Inference():
             precision="amp",
             device=self.device,
             load_weights_only=False,
+            **model_opt
             ).eval()
         self.tokenizer = FontTokenizer(token_dict=token_dict,context_length=77)
 
@@ -141,9 +142,10 @@ class FontClip_Inference_H14(FontClip_Inference):
 
     def __init__(self, device=None, size=224,
                  model_name="ViT-H-14",
-                 model_path="logs/CLIP_font_ViT_H14_s1712/checkpoints/epoch_3.pt",
+                 model_path="logs/ViT_H14_s1712/checkpoints/epoch_3.pt",
                  token_dict="data/font_vocab_1712.json",
-                 ann_file="") :
+                 ann_file="",
+                 **model_opt) :
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.name = "H14"
 
@@ -152,7 +154,8 @@ class FontClip_Inference_H14(FontClip_Inference):
             pretrained=model_path,
             precision="amp",
             device=self.device,
-            load_weights_only=False
+            load_weights_only=False,
+            **model_opt
         ).eval()
 
         self.tokenizer = FontTokenizer(token_dict=token_dict, context_length=77)
@@ -262,9 +265,15 @@ if __name__ == "__main__":
     model_name = "L14"  #["L14", "H14"]
 
     if model_name == "L14":
-        font_clip = FontClip_Inference()        # CLIP-L-14
+        font_clip = FontClip_Inference(
+            model_path="logs/ViT_L14_s1712_rope/checkpoints/epoch_13.pt",
+            use_rope=True
+        )        # CLIP-L-14
     elif model_name == "H14":
-        font_clip = FontClip_Inference_H14()
+        font_clip = FontClip_Inference_H14(
+            model_path="logs/ViT_H14_s1712/checkpoints/epoch_3.pt",
+            model_opt={}
+        )
 
 
     demo = gradio_ui(font_clip)

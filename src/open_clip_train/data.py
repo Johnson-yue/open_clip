@@ -31,6 +31,9 @@ except ImportError:
     hvd = None
 import torchvision.transforms as th_tfms
 from torchvision.transforms import InterpolationMode 
+import time
+from functools import partial
+from open_clip.tokenizer import FontTokenizer
 
 class CsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
@@ -746,6 +749,192 @@ def get_font_csv_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None,
 
     return DataInfo(dataloader, sampler)
 
+########################################################################################
+# Add Webdataset Warpper for dataset
+# time : 2024-12-10
+########################################################################################
+def preprocess(sample, 
+               tokenizer:FontTokenizer=None,
+               tfms:th_tfms.Compose=None,
+              
+               ):
+    # first in dataset , second in preprocess
+    # sample is list or tuple
+    # Return must be [image tensor, input_ids tensor]
+    imgpath, slabel = sample
+
+    # get image data
+    with Image.open(imgpath) as image:
+        image_np = np.asarray(image)
+        if image_np.ndim == 3:
+            image_np = image_np[:, :, 1]    # get render image data from green channel in V4 Dataset
+        image_3c = np.expand_dims(image_np, axis=-1)
+        image_3c = np.repeat(image_3c, 3, axis=-1)
+
+        image = Image.fromarray(image_3c, mode="RGB")   # convert np.ndarray to PIL.Image   
+    
+    images = tfms(image)
+
+    # get text data
+    human_label = imgpath.split("/")[-1].split("_")[1]
+    cont_map = tokenizer.json_data["ann_file"]
+    stroke_line = cont_map[human_label]
+    n_output_type = 4 if "<" in stroke_line and "<"!=stroke_line else 3
+    stroke_strs = [tokenizer.encode(stroke_line, output_type=i)["input_ids"] for i in range(1, n_output_type+1)]
+    input_ids = random.choice(stroke_strs)
+    texts = torch.LongTensor(input_ids)
+
+    return images, texts
+
+
+#Copied from :https://github.com/webdataset/webdataset/blob/1e47aa3de66a23fed0d0f28e787c46beb98ac538/webdataset/shardlists.py#L169
+class SimpleShardList_Font(IterableDataset):
+
+    """An iterable dataset yielding a list of URLs."""
+
+    def __init__(self, urls, seed=None, statis_json=None, epoch=-1):
+        """Initialize the SimpleShardList.
+
+        Args:
+            urls (str or List[str]): A list of URLs as a Python list or brace notation string.
+            seed (int or bool or None): Random seed for shuffling; if None, no shuffling is done,
+                if True, a random seed is generated.
+        """
+        super().__init__()
+        
+        self.urls = urls
+        if seed is True:
+            seed = time.time()
+        self.seed = seed
+
+        if statis_json :
+            assert os.path.isfile(statis_json), "%s not exist!"%statis_json
+            with open(statis_json, "r" , encoding="utf-8") as j :
+                statis = json.load(j)
+            self.content_stat = statis["content_stat"]
+            self.weight = [1/self.content_stat[url["png"].split("/")[-1].split("_")[1]] for url in self.urls]
+        else:
+            self.weight = statis_json
+
+        self.epoch = epoch
+
+
+    def __len__(self):
+        """Return the number of URLs in the list.
+
+        Returns:
+            int: The number of URLs.
+        """
+        return len(self.urls)
+
+    def __iter__(self):
+        """Return an iterator over the shards.
+
+        Yields:
+            dict: A dictionary containing the URL of each shard.
+        """
+        if isinstance(self.epoch, SharedEpoch):
+            epoch = self.epoch.get_value()
+        else:
+            self.epoch += 1
+            epoch = self.epoch
+
+        urls = self.urls
+        if self.seed is not None:
+            random.Random(self.seed).shuffle(urls)
+
+        if self.weight:
+            g = torch.Generator()
+            g.manual_seed(epoch)
+            # Resample with weight
+            rnd_indexes = WeightedRandomSampler(self.weight, num_samples=len(urls), 
+                                                replacement=True, generator=g)
+            url_reindex = [urls[r_i] for r_i in rnd_indexes]
+        else:
+            url_reindex = url
+
+        for  url in url_reindex:
+            yield url
+
+def get_font_wds_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None,floor=False):
+    input_filename = args.train_data if is_train else args.val_data
+    assert input_filename
+
+    size = 224
+    # define transformer function
+    tfms = th_tfms.Compose([
+        th_tfms.Resize(size),
+        th_tfms.ToTensor(),
+        th_tfms.Normalize(mean=[0.5,]*3, std=[0.5,]*3)
+    ])
+
+    # TODO: will be remove ,this is read all file not only train data
+    # base = []
+    # style_paths = []
+    # for rp in input_filename :
+    #     style_paths += [os.path.join(rp, s) for s in os.listdir(rp) if os.path.isdir(os.path.join(rp, s))] # rp1/s1, rp2/s2
+    
+    # style_paths_sorted = sorted(style_paths, key=lambda x:x.split("/")[-1])[:5]
+    # for slabel, style in enumerate(style_paths_sorted) :
+    #     imgfiles = os.listdir(style)
+    #     for img_f in tqdm(imgfiles, total=len(imgfiles), desc="style :"+style.split("/")[-1]):
+    #         base.append({"png":os.path.join(style, img_f), "slabel":slabel})
+
+    logging.debug(f'Loading font csv data from {input_filename}.')
+    df = pd.read_csv(input_filename, sep=args.csv_separator)
+    base = df[args.csv_img_key].tolist()
+
+
+    # build SharedEpoch
+    shared_epoch = SharedEpoch(epoch=epoch)
+
+    # build webdataset pipeline
+    pipeline = [
+        SimpleShardList_Font(base,
+            statis_json="data/font_statis_1712.json" if is_train else None, 
+            epoch=shared_epoch),
+        wds.to_tuple("png", "slabel"),
+        wds.split_by_worker,
+        wds.map(partial(preprocess, tokenizer=tokenizer, tfms=tfms)),
+        wds.batched(args.batch_size)
+    ]
+
+
+    dataset = wds.DataPipeline(
+       *pipeline
+    )
+
+
+    num_samples = len(base)
+
+   # compute *num_samples* and *num_batches*
+    if is_train:
+        round_fn = math.floor if floor else math.ceil
+        global_batch_size = args.batch_size * args.world_size
+        num_batches = round_fn(num_samples / global_batch_size)
+        num_workers = max(1, args.workers)
+        num_worker_batches = round_fn(num_batches / num_workers)    # per dataloader worker
+        num_batches = num_worker_batches * num_workers
+        num_samples = num_batches * global_batch_size
+        dataset = dataset.with_epoch(num_worker_batches)    # each worker is iterating over this
+    else:
+        num_batches = math.ceil(num_samples / args.batch_size)
+
+    # build dataloader
+    dataloader = wds.WebLoader(
+        dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=args.workers,
+        persistent_workers=args.workers >0
+    )
+
+    
+    dataloader.num_batches = num_batches
+    dataloader.num_samples = num_samples
+
+    return DataInfo(dataloader=dataloader, shared_epoch=shared_epoch)
+
 
 class SyntheticDataset(Dataset):
 
@@ -804,6 +993,8 @@ def get_dataset_fn(data_path, dataset_type):
         return get_csv_dataset
     elif dataset_type == "font_csv":
         return get_font_csv_dataset
+    elif dataset_type == "font_wds":    # this is load csv with webdataset format warpper
+        return get_font_wds_dataset 
     elif dataset_type == "synthetic":
         return get_synthetic_dataset
     elif dataset_type == "auto":
@@ -841,7 +1032,7 @@ def get_data(args, preprocess_fns, epoch=0, tokenizer=None):
 
 
 if __name__ == "__main__":
-    from open_clip.tokenizer import FontTokenizer
+    
     from tqdm import tqdm
     tokenizer =  FontTokenizer(token_dict="data/font_vocab_1712.json", 
                                context_length=77)
